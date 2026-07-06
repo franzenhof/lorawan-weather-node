@@ -6,25 +6,29 @@
  *
  * LPP channel mapping:
  *   Ch 1  Direction        → wind direction (°)
- *   Ch 1  Analog Input     → avg wind speed (km/h, resolution 0.01)
- *   Ch 2  Analog Input     → wind gust max (km/h, resolution 0.01)
+ *   Ch 1  Analog Input     → avg wind speed (m/s or km/h, resolution 0.01)
+ *   Ch 2  Analog Input     → wind gust max (m/s or km/h, resolution 0.01)
  *   Ch 3  Analog Input     → rain rate (mm/h, resolution 0.01)
+ *   Ch 203 Analog Input    → free heap (KiB, debug mode)
+ *   Ch 204 Analog Input    → uptime (h, debug mode)
  *   Ch 1  Distance         → rain current cycle (m, ×1000 → mm)
  *   Ch 2  Distance         → rain since start (m, ×1000 → mm)
- *   Ch 1  Temperature      → CPU temperature (°C)
- *   Ch 1  Digital Input    → cycle counter (0–255)
  *   Ch 2  Digital Input    → status byte (bitmask, see below)
+ *   Ch 200 Digital Input   → cycle counter (0–255, debug mode)
+ *   Ch 202 Digital Input   → send fail counter (0–255, debug mode)
  *   Ch 1  Voltage          → LiPo voltage (V, optional)
- *   Ch 1  Rel. Humidity    → humidity (%, BME280)
- *   Ch 1  Baro. Pressure   → barometric pressure QNH (hPa, BME280)
- *   Ch 2  Baro. Pressure   → barometric pressure absolute (hPa, BME280)
- *   Ch 2  Temperature      → temperature (°C, BME280)
- *   Ch 3–5 Temperature     → DS18B20 sensor 0–2 (°C)
+ *   Ch 1  Rel. Humidity    → bme280 humidity (%, BME280)
+ *   Ch 1  Baro. Pressure   → bme280 barometric pressure QNH (hPa, BME280)
+ *   Ch 2  Baro. Pressure   → bme280 barometric pressure absolute (hPa, BME280)
+ *   Ch 1  Temperature      → bme280 temperature (°C, BME280)
+ *   Ch 2–4 Temperature     → DS18B20 sensor 0–2 (°C)
+ *   Ch 201 Temperature     → CPU temperature (°C, debug mode)
  *
  * Status byte (Ch 2 Digital Input):
  *   Bit 0 : BME280 present (1=yes)
  *   Bit 1 : 1-Wire has sensors (1=yes)
  *   Bit 2–5: send fail counter (0–15, clipped)
+ *   Bit 6 : wind speed unit (0=km/h, 1=m/s)
  *
  * Rain accumulator note:
  *   "rain_since_start_mm" is a continuous counter since the last power-on.
@@ -63,7 +67,8 @@ function decodeStatus(byte) {
     return {
         bme280_present:   (byte & 0x01) !== 0,
         bus1_has_sensors: (byte & 0x02) !== 0,
-        send_fail_count:  (byte >> 2) & 0x0F
+        send_fail_count:  (byte >> 2) & 0x0F,
+        wind_speed_unit:  (byte & 0x40) !== 0 ? "m/s" : "km/h"
     };
 }
 
@@ -94,9 +99,11 @@ function parseLPP(bytes) {
             case LPP_ANALOG_INPUT:
                 var aval = int16BE(bytes, i) / 100.0;
                 i += 2;
-                if (channel === 1) result.wind_speed_avg_kmh = aval;
-                else if (channel === 2) result.wind_gust_kmh  = aval;
+                if (channel === 1) result.wind_speed_avg = aval;
+                else if (channel === 2) result.wind_gust  = aval;
                 else if (channel === 3) result.rain_rate_mmh  = aval;
+                else if (channel === 203) result.debug_free_heap_kib = aval;
+                else if (channel === 204) result.debug_uptime_h = aval;
                 break;
 
             case LPP_DISTANCE:
@@ -111,16 +118,18 @@ function parseLPP(bytes) {
             case LPP_TEMPERATURE:
                 var tval = int16BE(bytes, i) / 10.0;
                 i += 2;
-                if (channel === 1) result.cpu_temperature_c   = tval;
-                else if (channel === 2) result.bme280_temperature_c = tval;
-                else if (channel >= 3 && channel <= 5)
-                    result["ds18b20_" + (channel - 3) + "_c"] = tval;
+                if (channel === 1) result.bme280_temperature_c = tval;
+                else if (channel >= 2 && channel <= 4)
+                    result["ds18b20_" + (channel - 2) + "_c"] = tval;
+                else if (channel === 201) result.debug_cpu_temperature_c = tval;
                 break;
 
             case LPP_DIGITAL_INPUT:
                 var dival = bytes[i++];
-                if (channel === 1) result.cycle_counter = dival;
+                if (channel === 1) result.cycle_counter = dival; // legacy payloads
                 else if (channel === 2) result.status = decodeStatus(dival);
+                else if (channel === 200) result.debug_cycle_counter = dival;
+                else if (channel === 202) result.debug_send_fail_count = dival;
                 break;
 
             case LPP_VOLTAGE:
@@ -129,14 +138,14 @@ function parseLPP(bytes) {
                 break;
 
             case LPP_HUMIDITY:
-                result.humidity_pct = bytes[i++] / 2.0;
+                result.bme280_humidity_pct = bytes[i++] / 2.0;
                 break;
 
             case LPP_BAROMETRIC:
                 var pval = uint16BE(bytes, i) / 10.0;
                 i += 2;
-                if (channel === 1) result.pressure_qnh_hpa = pval;
-                else if (channel === 2) result.pressure_abs_hpa = pval;
+                if (channel === 1) result.bme280_pressure_qnh_hpa = pval;
+                else if (channel === 2) result.bme280_pressure_abs_hpa = pval;
                 break;
 
             default:

@@ -1,7 +1,69 @@
 # LoRaWAN Weather Node
 
 Firmware for a custom-designed PCB based on a **Heltec WiFi LoRa 32 V3** (ESP32-S3).  
-The node measures wind speed, wind direction, rainfall, temperature, humidity, and barometric pressure and transmits the data via **LoRaWAN (EU868, OTAA)** to a private ChirpStack server.
+The node measures wind speed, wind direction, rainfall, temperature, humidity, and barometric pressure and transmits the data via **LoRaWAN (OTAA, region configurable; default: EU868)** to a private ChirpStack server.
+
+The images below give a quick impression of the hardware journey from empty PCB to finished node and show how the measured data can be visualized in Grafana.
+
+## Project in Pictures
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="pictures/pcb-v12-empty.jpeg" alt="PCB Rev 1.2, empty board" width="100%">
+      <br><strong>PCB, empty</strong>
+    </td>
+    <td align="center" width="33%">
+      <img src="pictures/pcb-v12-assembled.jpeg" alt="PCB Rev 1.2, assembled board" width="100%">
+      <br><strong>PCB, assembled</strong>
+    </td>
+    <td align="center" width="33%">
+      <img src="pictures/pcb-v12-operational.jpeg" alt="PCB Rev 1.2, operational board" width="100%">
+      <br><strong>PCB, in operation</strong>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="pictures/grafana-wind.jpeg" alt="Grafana dashboard for wind data" width="100%">
+      <br><strong>Grafana: wind data</strong>
+    </td>
+    <td align="center" width="50%">
+      <img src="pictures/grafana-rain-temp-preassure.jpeg" alt="Grafana dashboard for rain, temperature and pressure" width="100%">
+      <br><strong>Grafana: rain, temperature and pressure</strong>
+    </td>
+  </tr>
+</table>
+
+The following screenshots show the Wi-Fi configuration flow. This setup is designed to be quick and beginner-friendly, even without USB tools.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="pictures/wifi-config-startpage.png" alt="Wi-Fi manager start page" width="100%">
+      <br><strong>Wi-Fi manager: start page</strong>
+    </td>
+    <td align="center" width="50%">
+      <img src="pictures/wifi-config-parameters.png" alt="Wi-Fi manager parameters page" width="100%">
+      <br><strong>Wi-Fi manager: parameter page</strong>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="pictures/wifi-config-firmwareupdate.jpeg" alt="Wi-Fi manager firmware update page" width="100%">
+      <br><strong>Wi-Fi manager: firmware update</strong>
+    </td>
+    <td align="center" width="50%">
+      <img src="pictures/wifi-config-firmwareupdate-success.jpeg" alt="Wi-Fi manager firmware update successful" width="100%">
+      <br><strong>Wi-Fi manager: update successful</strong>
+    </td>
+  </tr>
+</table>
 
 ---
 
@@ -26,12 +88,12 @@ This project is fully open-source. To support both software developers and hardw
                    [Davis AeroCone]  [LiPo optional]
                    Rain sensor
                               │
-                           [LoRaWAN EU868]
+                              [LoRaWAN (default EU868)]
                               │
                        [ChirpStack server]
 ```
 
-The node runs continuously (no deep sleep), measures without interruption, and transmits a LoRaWAN uplink every configurable number of seconds. Typical send interval: 3–60 seconds.
+The node runs continuously (no deep sleep), measures without interruption, and transmits a LoRaWAN uplink every configurable number of seconds. Typical uplink interval: 60–300 seconds.
 
 ---
 
@@ -41,7 +103,7 @@ The node runs continuously (no deep sleep), measures without interruption, and t
 |-----------|----------|
 | Heltec WiFi LoRa 32 V3 | Microcontroller (ESP32-S3), LoRa SX1262, OLED display 128×64 |
 | Davis 6410 Anemometer | Wind speed (reed switch) + wind direction (potentiometer 20 kΩ) |
-| Davis AeroCone / Standard | Rainfall (reed switch, 0.2 mm/pulse) |
+| Davis AeroCone / Standard (typically 6466M) | Rainfall (reed switch, 0.2 mm/pulse) |
 | BME280 | Temperature / humidity / barometric pressure (I²C 0x76, up to 2 m RJ45 cable) |
 | DS18B20 | Up to 3 temperature sensors (1-Wire, external) |
 | LiPo battery | Optional; voltage measurement via voltage divider + ADC |
@@ -82,9 +144,8 @@ In addition to mechanically connecting the connectors, the PCB provides the foll
 | **5** | **6** | 1-Wire bus (DS18B20, up to 3 sensors) |
 | **6** | **3** | unused / free |
 | – | **47** | 1-Wire high-side switch (OUT, HIGH = bus powered) |
-| – | **7** | completely free (no firmware use, no PCB connection) |
 
-> The active PCB revision is configured in the Wi-Fi portal (default: **12** for Rev 1.2).
+> The active PCB revision is configured in the Wi-Fi portal (default: **13** for Rev 1.3).
 
 ### Wind Sensor (Davis 6410) – RJ11 6-pin
 
@@ -97,7 +158,7 @@ In addition to mechanically connecting the connectors, the PCB provides the foll
 | 5 | Black | Wind speed (reed switch → PCNT) |
 | 6 | – | n/c |
 
-### Rain Sensor – RJ11 6-pin
+### Rain Sensor (Davis 6466M) – RJ11 6-pin
 
 | Pin | Color | Function |
 |-----|-------|----------|
@@ -132,7 +193,7 @@ Conversion per Davis specification:
 Wind speed [km/h] = pulses/s × 2.25 × 1.60934
 ```
 
-The **maximum wind gust** (maximum per send interval) is also captured and transmitted separately.
+The **maximum wind gust** (maximum per uplink interval) is also captured and transmitted separately.
 
 ### Wind Direction
 The Davis 6410 contains a **potentiometer (20 kΩ)** powered directly from VCC3.3.  
@@ -174,19 +235,25 @@ QNH = absolute pressure × (1 - 0.0000226 × altitude[m])^(-5.255)
 | Channel | Type | Content | Unit | Active when |
 |---------|------|---------|------|-------------|
 | Ch 1 | Direction | Wind direction | ° | `windEn = 1` |
-| Ch 1 | Analog Input | Avg wind speed | km/h | `windEn = 1` |
-| Ch 2 | Analog Input | Wind gust (maximum) | km/h | `windEn = 1` |
+| Ch 1 | Analog Input | Avg wind speed | m/s or km/h | `windEn = 1` |
+| Ch 2 | Analog Input | Wind gust (maximum) | m/s or km/h | `windEn = 1` |
 | Ch 3 | Analog Input | Rain rate | mm/h | `rainEn = 1` |
 | Ch 1 | Distance | Rain current cycle | mm | `rainEn = 1` |
 | Ch 2 | Distance | Rain since start | mm | `rainEn = 1` |
-| Ch 1 | Temperature | CPU temperature (internal) | °C | always |
-| Ch 1 | Digital Input | Cycle counter | 0–255 | always |
+| Ch 2 | Digital Input | Status bitfield (BME280, 1-Wire, send-fail count, wind unit) | bitfield | always |
+| Ch 200 | Digital Input | Cycle counter (debug) | 0–255 | `debugMode = 1` |
+| Ch 202 | Digital Input | Send fail counter (debug) | 0–255 | `debugMode = 1` |
+| Ch 201 | Temperature | CPU temperature (debug) | °C | `debugMode = 1` |
+| Ch 203 | Analog Input | Free heap (debug) | KiB | `debugMode = 1` |
+| Ch 204 | Analog Input | Uptime (debug) | h | `debugMode = 1` |
 | Ch 1 | Voltage | LiPo voltage | V | `lipoEn = 1` |
 | Ch 1 | Rel. Humidity | Humidity | % | BME280 detected |
 | Ch 1 | Baro. Pressure | Barometric pressure QNH | hPa | BME280 detected |
 | Ch 2 | Baro. Pressure | Barometric pressure absolute | hPa | BME280 detected |
-| Ch 2 | Temperature | BME280 temperature | °C | BME280 detected |
-| Ch 3–5 | Temperature | DS18B20 sensor 0–2 | °C | sensor detected |
+| Ch 1 | Temperature | BME280 temperature | °C | BME280 detected |
+| Ch 2–4 | Temperature | DS18B20 sensor 0–2 | °C | sensor detected |
+
+> In normal operation (`debugMode = 0`) no debug telemetry is sent.
 
 > **Payload size:**  
 > Minimal config (DS18B20 only): approx. 15–30 bytes – fits in DR0 (SF12, 51 bytes).  
@@ -215,22 +282,52 @@ The portal can be opened at any time in two ways:
 
 > **Note:** GPIO 0 must **not** be pressed during power-on or reset – this would activate the ESP32 bootloader instead of the firmware. The portal is therefore triggered by a long press *during operation* only.
 
+### Firmware update via Wi-Fi portal (OTA)
+Firmware updates can be done wirelessly while the portal is open:
+
+1. Open the Wi-Fi portal (either long press on user button for at least 3 seconds, or LoRaWAN downlink `0x03`)
+2. Connect to the board Wi-Fi **WeatherNode**
+3. Open **http://192.168.4.1** in a normal browser
+4. On the portal start page, click **Firmwareupdate**
+5. Upload the `.bin` file and wait until the board reboots
+
+> If the captive portal page does not allow file upload, open **http://192.168.4.1/update** directly in the browser.
+
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | DevEUI | 16 hex chars, from ChirpStack | – |
 | JoinEUI | 16 hex chars, from ChirpStack | – |
 | AppKey | 32 hex chars, from ChirpStack | – |
-| PCB revision | 12 = Rev 1.2, 13 = Rev 1.3 | 12 |
+| LoRaWAN region | `EU868`, `US915`, `AU915`, `AS923`, `IN865`, `KR920`, `CN470`, `RU864` | EU868 |
+| PCB revision | 12 = Rev 1.2, 13 = Rev 1.3 | 13 |
 | Altitude above sea level (m) | Station altitude for QNH calculation | 560 |
-| Send interval (s) | Target interval per measurement cycle; EU868 duty cycle: min. 5 s at SF7 | 3 |
-| Sample interval (s) | Sub-sample interval within a cycle; ≤ send interval | 3 |
+| Uplink interval (s) | Target interval per measurement cycle | 300 |
+| Sample interval (s) | Sub-sample interval within a cycle; ≤ uplink interval | 3 |
+| Wind speed unit (0=km/h, 1=m/s) | Unit used for transmitted wind speed and gust values | 1 |
 | Wind direction offset (°) | North correction during installation (−180 to +180) | 0 |
 | Wind sensor (1=Yes) | Davis wind sensor enabled | 1 |
 | Rain sensor (1=Yes) | Davis rain sensor enabled | 1 |
-| LiPo measurement (1=Yes) | Voltage measurement via voltage divider enabled | 1 |
+| LiPo measurement (1=Yes) | Voltage measurement via voltage divider enabled | 0 |
+| Debug mode (1=Yes) | Adds cycle counter, CPU temp and extra diagnostics in high LPP channels | 0 |
 | CPU frequency (80/240 MHz) | 80 MHz saves power; below 80 MHz not allowed (PCNT-APB dependency) | 80 |
 
 > All settings are stored persistently in the **NVS (Non-Volatile Storage)** of the ESP32-S3 and survive restarts and firmware updates.
+
+> Region input in the portal is validated. Unsupported values fall back to **EU868**.
+
+### Debug mode
+
+`debugMode` was introduced to support bench testing (for example without connected weather sensors) and fast diagnostics without affecting normal airtime.
+
+When enabled, the node adds extra telemetry to high LPP channels (200+):
+
+1. Cycle counter
+2. CPU temperature
+3. Send-fail counter
+4. Free heap (KiB)
+5. Uptime (hours)
+
+When disabled (default), these values are not part of the uplink payload.
 
 ---
 
@@ -261,18 +358,22 @@ The file `chirpstack/decoder.js` contains the JavaScript decoder for ChirpStack 
 ```json
 {
   "wind_direction_deg": 247,
-  "wind_speed_avg_kmh": 12.30,
-  "wind_gust_kmh": 18.50,
+  "wind_speed_avg": 12.30,
+  "wind_gust": 18.50,
   "rain_rate_mmh": 0.00,
   "rain_cycle_mm": 0.0,
   "rain_since_start_mm": 14.2,
-  "cpu_temperature_c": 43.5,
   "cycle_counter": 42,
-  "status": { "bme280_present": true, "bus1_has_sensors": true, "send_fail_count": 0 },
+  "status": {
+    "bme280_present": true,
+    "bus1_has_sensors": true,
+    "send_fail_count": 0,
+    "wind_speed_unit": "m/s"
+  },
   "battery_v": 3.98,
-  "humidity_pct": 67.5,
-  "pressure_qnh_hpa": 1013.2,
-  "pressure_abs_hpa": 952.1,
+  "bme280_humidity_pct": 67.5,
+  "bme280_pressure_qnh_hpa": 1013.2,
+  "bme280_pressure_abs_hpa": 952.1,
   "bme280_temperature_c": 21.3,
   "ds18b20_0_c": 18.6,
   "ds18b20_1_c": 19.1
@@ -281,6 +382,34 @@ The file `chirpstack/decoder.js` contains the JavaScript decoder for ChirpStack 
 
 **Rain accumulator evaluation:**  
 `rain_since_start_mm` is a cumulative counter. The delta between two received packets gives the actual rainfall – even if packets were lost in between.
+
+---
+
+## TTN (The Things Stack) Instead of Private ChirpStack
+
+The node can be used with TTN/TTS as well. No payload format change is required, because the uplink is still standard CayenneLPP and the same decoder logic can be used.
+
+### What to configure
+
+1. In the Wi-Fi portal, set **LoRaWAN region** to the matching regional plan of your TTN deployment (for Europe typically `EU868`).
+2. In TTN, create an end device using **OTAA**, LoRaWAN 1.0.x profile, and copy **DevEUI / JoinEUI / AppKey** into the node portal.
+3. Add the payload formatter (JavaScript) in TTN by reusing [chirpstack/decoder.js](chirpstack/decoder.js) logic (field names can stay the same).
+
+### Fair-use and practical intervals (EU868)
+
+TTN strongly favors low airtime and low uplink rates. Practical guidance for weather telemetry:
+
+1. Prefer **60 s to 300 s** uplink intervals.
+2. Avoid high-spreading-factor operation with very short intervals.
+3. Keep payload compact (disable unused sensors in the portal).
+
+For TTN community networks, very short uplink intervals are generally not appropriate and may violate fair-use expectations depending on data rate and gateway conditions.
+
+For TTN operation, keep `debugMode` disabled except for short troubleshooting windows.
+
+### Do you need further firmware changes for TTN?
+
+In most cases: **no functional code changes** are required. The key points are correct region and OTAA credentials.
 
 ---
 
@@ -295,6 +424,28 @@ Downlinks are sent on **FPort 1** with a single byte:
 | `0x01` | Reset rain accumulator (rain since start) to 0 |
 | `0x02` | Restart device (triggers a new OTAA join) |
 | `0x03` | Open Wi-Fi config portal (takes effect after the current send cycle completes) |
+| `0x04` | Enable debug mode (persistent) |
+| `0x05` | Disable debug mode (persistent) |
+
+Parameter updates are sent on **FPort 1** with command `0x10`:
+
+`[0x10, paramId, valueMSB, valueLSB, ...]`
+
+Multiple parameter triplets may be included in one downlink. Values are interpreted as signed 16-bit and validated.
+
+| Param ID | Parameter | Valid range / values |
+|----------|-----------|----------------------|
+| `1` | `uplinkIntervalSec` | `5..3600` |
+| `2` | `sampleSec` | `1..uplinkIntervalSec` |
+| `3` | `windEn` | `0` or `1` |
+| `4` | `rainEn` | `0` or `1` |
+| `5` | `lipoEn` | `0` or `1` |
+| `6` | `debugMode` | `0` or `1` |
+| `7` | `windDirOffsetDeg` | `-180..180` |
+| `8` | `windUnitMs` | `0` or `1` |
+| `9` | `cpuFreqMhz` | `80` or `240` |
+
+Valid parameters are stored persistently in NVS immediately.
 
 ---
 
@@ -312,16 +463,32 @@ Wind ADC (direction) and battery ADC are averaged over **8 samples** to reduce E
 
 ---
 
-## Send Interval and Timing
+## Uplink Interval and Timing
 
-The configured send interval is a **target value**: at the end of each cycle the code only waits the remaining time until the target interval (`millis()` delta). This prevents the measurement time (1-Wire conversion ~750 ms, LoRa airtime ~500 ms) from adding up twice.
+The configured uplink interval is a **target value**: at the end of each cycle the code only waits the remaining time until the target interval (`millis()` delta). This prevents the measurement time (1-Wire conversion ~750 ms, LoRa airtime ~500 ms) from adding up twice.
 
 ```
 Cycle start → measure → send → sleep(max(0, target − elapsed))
 ```
 
+`Sample interval` and `Uplink interval` have different roles:
+
+- **Sample interval** (`sampleSec`): defines how often sub-samples are taken within one uplink cycle.
+- **Uplink interval** (`uplinkIntervalSec`): defines when one uplink is generated from the accumulated sub-samples.
+
+Within one send cycle, values are combined as follows:
+
+- **Wind speed (avg)**: arithmetic mean of all wind speed sub-samples.
+- **Wind gust (max)**: maximum wind speed seen in all sub-samples of that cycle.
+- **Wind direction**: vector average (sin/cos) across all sub-samples.
+- **Rain cycle**: sum of rain pulses within the cycle.
+- **Rain rate**: derived from the cycle rain amount and full cycle duration.
+- **BME280 temperature/humidity/pressure**: arithmetic mean of all BME280 sub-samples.
+- **DS18B20 temperatures**: measured once per uplink cycle (not sub-sampled/averaged over `sampleSec`).
+
 **Minimum practical interval** in EU868 at DR5 (SF7): ~5 s (duty cycle restriction).  
-**Default value of 3 s** is sufficient for gateways with a private ChirpStack server without FUP restrictions.
+For TTN/community networks, use significantly longer intervals (typically at least 60 s).  
+**Default values:** uplink interval `300 s`, sample interval `3 s`.
 
 ---
 

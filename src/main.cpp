@@ -23,23 +23,30 @@
  *   0x01 → reset rain accumulator (since start)
  *   0x02 → restart device
  *   0x03 → open Wi-Fi config portal (takes effect after current send cycle)
+ *   0x04 → enable debug mode (persistent)
+ *   0x05 → disable debug mode (persistent)
+ *   0x10 → set parameter(s): [0x10, paramId, valueMSB, valueLSB, ...]
+ *           paramId 1..9 (signed 16-bit values, validated)
  *
  * LPP channel mapping:
  *   Ch  1 Direction        → wind direction (°, if wind sensor enabled)
- *   Ch  1 Analog Input     → avg wind speed (km/h, if wind sensor enabled)
- *   Ch  2 Analog Input     → wind gust max (km/h, if wind sensor enabled)
+ *   Ch  1 Analog Input     → avg wind speed (m/s or km/h, if wind sensor enabled)
+ *   Ch  2 Analog Input     → wind gust max (m/s or km/h, if wind sensor enabled)
  *   Ch  3 Analog Input     → rain rate (mm/h, if rain sensor enabled)
+ *   Ch200 Analog Input     → free heap (KiB, debug mode only)
+ *   Ch204 Analog Input     → uptime (h, debug mode only)
  *   Ch  1 Distance         → rain current cycle (m; ×1000 → mm, if rain sensor enabled)
  *   Ch  2 Distance         → rain since start (m; ×1000 → mm, if rain sensor enabled)
- *   Ch  1 Temperature      → CPU temperature (°C)
- *   Ch  1 Digital Input    → cycle counter (0–255, wrap-around)
- *   Ch  2 Digital Input    → status byte: Bit0=BME280, Bit1=Bus1, Bit2-5=errors
+ *   Ch  2 Digital Input    → status byte: Bit0=BME280, Bit1=Bus1, Bit2-5=errors, Bit6=wind unit
+ *   Ch200 Digital Input    → cycle counter (0–255, debug mode only)
+ *   Ch202 Digital Input    → send fail counter (0-255, debug mode only)
  *   Ch  1 Voltage          → LiPo voltage (V, optional)
  *   Ch  1 Rel. Humidity    → humidity (%, BME280)
  *   Ch  1 Baro. Pressure   → barometric pressure QNH (hPa, BME280)
  *   Ch  2 Baro. Pressure   → barometric pressure absolute (hPa, BME280)
- *   Ch  2 Temperature      → temperature (°C, BME280)
- *   Ch  3–5 Temperature    → DS18B20 Bus 1 sensor 0–2 (°C)
+ *   Ch  1 Temperature      → temperature (°C, BME280)
+ *   Ch  2–4 Temperature    → DS18B20 Bus 1 sensor 0–2 (°C)
+ *   Ch201 Temperature      → CPU temperature (°C, debug mode only)
  */
 
 // ============================================================================
@@ -92,6 +99,11 @@
 #include <ArduinoOTA.h>
 #include <esp_netif.h>
 #include <esp_event.h>
+#include "generated_version.h"
+
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "dev"
+#endif
 
 // ============================================================================
 // CONFIGURATION (persistent via NVS / Preferences)
@@ -100,14 +112,17 @@ struct Config {
     uint64_t joinEui           = 0;
     uint64_t devEui            = 0;
     uint8_t  appKey[16]        = {};
-    int      pcbVersion        = 12;  // 12 = Rev 1.2, 13 = Rev 1.3
+    char     region[8]         = "EU868"; // LoRaWAN region (default)
+    int      pcbVersion        = 13;  // 12 = Rev 1.2, 13 = Rev 1.3
     int      altitudeM         = BME280_DEFAULT_ALTITUDE;
-    int      sendDelaySec      = 3;   // target interval (s); EU868 duty cycle: min. 5 s at SF7
-    int      sampleSec         = 3;   // sub-sample interval (s); ≤ sendDelaySec
+    int      uplinkIntervalSec = 300;  // target uplink interval (s)
+    int      sampleSec         = 3;    // sub-sample interval (s); <= uplinkIntervalSec
     int      windDirOffsetDeg  = 0;   // north offset (added to raw value, mod 360)
+    int      windUnitMs         = 1;   // 1 = transmit wind in m/s, 0 = transmit in km/h
     int      windEn            = 1;   // 1 = Davis wind sensor enabled (direction + speed)
     int      rainEn            = 1;   // 1 = Davis rain sensor enabled
-    int      lipoEn            = 1;   // 1 = LiPo measurement enabled (saves 4 LPP bytes when 0)
+    int      lipoEn            = 0;   // 1 = LiPo measurement enabled (saves 4 LPP bytes when 0)
+    int      debugMode         = 0;   // 1 = include debug telemetry in payload
     int      cpuFreqMhz        = 80;  // 80 or 240 MHz; below 80 not allowed (PCNT-APB)
 };
 
@@ -137,6 +152,47 @@ static void hexToBytes(const char* s, uint8_t* out, size_t maxLen)
     }
 }
 
+static void uint64ToHex(uint64_t value, char* out, size_t outSize)
+{
+    if (outSize > 0) {
+        snprintf(out, outSize, "%016llX", (unsigned long long)value);
+    }
+}
+
+static void bytesToHex(const uint8_t* bytes, size_t byteCount, char* out, size_t outSize)
+{
+    size_t pos = 0;
+    if (outSize == 0) return;
+
+    for (size_t i = 0; i < byteCount && (pos + 2) < outSize; ++i) {
+        pos += snprintf(out + pos, outSize - pos, "%02X", bytes[i]);
+    }
+}
+
+static bool isSupportedRegion(const String& region)
+{
+    static const char* const kRegions[] = {
+        "EU868", "US915", "AU915", "AS923", "IN865", "KR920", "CN470", "RU864"
+    };
+    for (size_t i = 0; i < (sizeof(kRegions) / sizeof(kRegions[0])); ++i) {
+        if (region == kRegions[i]) return true;
+    }
+    return false;
+}
+
+static void normalizeRegionInput(const char* raw, char* out, size_t outSize)
+{
+    String region = raw ? String(raw) : String("");
+    region.trim();
+    region.toUpperCase();
+    region.replace(" ", "");
+
+    if (!isSupportedRegion(region)) {
+        region = "EU868";
+    }
+    strlcpy(out, region.c_str(), outSize);
+}
+
 static Config loadConfig()
 {
     Preferences prefs;
@@ -149,16 +205,20 @@ static Config loadConfig()
     }
     c.pcbVersion       = prefs.getInt    ("pcbver",   c.pcbVersion);
     c.altitudeM        = prefs.getInt    ("altitude", c.altitudeM);
-    c.sendDelaySec     = prefs.getInt    ("delay",    c.sendDelaySec);
+    c.uplinkIntervalSec = prefs.getInt   ("uplinksec", prefs.getInt("delay", c.uplinkIntervalSec));
     c.sampleSec        = prefs.getInt    ("samplesec", c.sampleSec);
     c.windDirOffsetDeg = prefs.getInt    ("windoff",  c.windDirOffsetDeg);
+    c.windUnitMs       = prefs.getInt    ("windunit", c.windUnitMs);
     c.windEn           = prefs.getInt    ("winden",   c.windEn);
     c.rainEn           = prefs.getInt    ("rainen",   c.rainEn);
     c.lipoEn           = prefs.getInt    ("lipoen",   c.lipoEn);
+    c.debugMode        = prefs.getInt    ("debugmode", c.debugMode);
     c.cpuFreqMhz       = prefs.getInt    ("cpufreq",  c.cpuFreqMhz);
     c.devEui           = prefs.getULong64("deveui",   0);
     c.joinEui          = prefs.getULong64("joineui",  0);
     prefs.getBytes("appkey", c.appKey, 16);
+    String region      = prefs.getString("region", c.region);
+    normalizeRegionInput(region.c_str(), c.region, sizeof(c.region));
     prefs.end();
     return c;
 }
@@ -169,16 +229,19 @@ static void saveConfig(const Config& c)
     prefs.begin("config", false);
     prefs.putInt    ("pcbver",   c.pcbVersion);
     prefs.putInt    ("altitude", c.altitudeM);
-    prefs.putInt    ("delay",    c.sendDelaySec);
+    prefs.putInt    ("uplinksec", c.uplinkIntervalSec);
     prefs.putInt    ("samplesec", c.sampleSec);
     prefs.putInt    ("windoff",  c.windDirOffsetDeg);
+    prefs.putInt    ("windunit", c.windUnitMs);
     prefs.putInt    ("winden",   c.windEn);
     prefs.putInt    ("rainen",   c.rainEn);
     prefs.putInt    ("lipoen",   c.lipoEn);
+    prefs.putInt    ("debugmode", c.debugMode);
     prefs.putInt    ("cpufreq",  c.cpuFreqMhz);
     prefs.putULong64("deveui",   c.devEui);
     prefs.putULong64("joineui",  c.joinEui);
     prefs.putBytes  ("appkey",   c.appKey, 16);
+    prefs.putString ("region",   c.region);
     prefs.end();
 }
 
@@ -199,32 +262,48 @@ static Config runConfigPortal(const Config& cur)
     display.drawString(0, 0, "Starting config portal...");
     display.display();
 
-    char b_pcb[4], b_alt[8], b_delay[8], b_sample[4], b_windoff[6], b_cpu[4];
+    char b_dev[17], b_join[17], b_key[33], b_region[8], b_pcb[4], b_alt[8], b_uplink[8], b_sample[4], b_windoff[6], b_windunit[2], b_debug[2], b_cpu[4];
+    uint64ToHex(cur.devEui, b_dev, sizeof(b_dev));
+    uint64ToHex(cur.joinEui, b_join, sizeof(b_join));
+    bytesToHex(cur.appKey, 16, b_key, sizeof(b_key));
+    strlcpy(b_region, cur.region, sizeof(b_region));
     itoa(cur.pcbVersion,       b_pcb,     10);
     itoa(cur.altitudeM,        b_alt,     10);
-    itoa(cur.sendDelaySec,     b_delay,   10);
+    itoa(cur.uplinkIntervalSec, b_uplink,  10);
     itoa(cur.sampleSec,        b_sample,  10);
     itoa(cur.windDirOffsetDeg, b_windoff, 10);
+    itoa(cur.windUnitMs,       b_windunit, 10);
+    itoa(cur.debugMode,        b_debug,   10);
     itoa(cur.cpuFreqMhz,       b_cpu,     10);
 
-    WiFiManagerParameter p_dev    ("dev",      "DevEUI (16 hex chars)",                        "",       17);
-    WiFiManagerParameter p_join   ("join",     "JoinEUI (16 hex chars)",                       "",       17);
-    WiFiManagerParameter p_key    ("key",      "AppKey (32 hex chars)",                        "",       33);
+    WiFiManagerParameter p_dev    ("dev",      "DevEUI (16 hex chars)",                        b_dev,     17);
+    WiFiManagerParameter p_join   ("join",     "JoinEUI (16 hex chars)",                       b_join,    17);
+    WiFiManagerParameter p_key    ("key",      "AppKey (32 hex chars)",                        b_key,     33);
+    WiFiManagerParameter p_region ("region",   "LoRaWAN region (EU868, US915, AU915, AS923, IN865, KR920, CN470, RU864)", b_region, 8);
     WiFiManagerParameter p_pcb    ("pcbver",   "PCB revision (12=Rev1.2, 13=Rev1.3)",          b_pcb,     3);
     WiFiManagerParameter p_alt    ("altitude", "Altitude above sea level in m (0-4000)",       b_alt,     6);
-    WiFiManagerParameter p_delay  ("delay",    "Send interval in s (min. 5 at SF7, max. 3600)", b_delay, 6);
-    WiFiManagerParameter p_sample ("samplesec","Sample interval in s (1 to send interval)",    b_sample,  4);
+    WiFiManagerParameter p_uplink ("uplinksec","Uplink interval in s (5-3600 typical)",         b_uplink, 7);
+    WiFiManagerParameter p_sample ("samplesec","Sample interval in s (1 to uplink interval)",  b_sample, 4);
     WiFiManagerParameter p_windoff("windoff",  "Wind direction offset in degrees (-180 to +180)", b_windoff, 5);
+    WiFiManagerParameter p_windunit("windunit", "Wind speed unit (0=km/h, 1=m/s)",             b_windunit, 2);
     WiFiManagerParameter p_winden ("winden",   "Wind sensor enabled (0=No, 1=Yes)",            cur.windEn ? "1" : "0", 2);
     WiFiManagerParameter p_rainen ("rainen",   "Rain sensor enabled (0=No, 1=Yes)",            cur.rainEn ? "1" : "0", 2);
     WiFiManagerParameter p_lipo   ("lipoen",   "LiPo measurement enabled (0=No, 1=Yes)",       cur.lipoEn ? "1" : "0", 2);
+    WiFiManagerParameter p_debug  ("debugmode","Debug mode (0=No, 1=Yes, sends extra telemetry)", b_debug, 2);
     WiFiManagerParameter p_cpu    ("cpufreq",  "CPU frequency in MHz (80 or 240)",             b_cpu,     4);
+    WiFiManagerParameter p_section("<div style='margin:0.5rem 0 0.75rem 0;'><h3>LoRa-Weather-Node Parameter</h3><p style='margin:0 0 0.35rem 0;'>Firmware version: " FIRMWARE_VERSION "</p><p style='margin:0;'>Device settings are shown here on a separate page.</p></div>");
 
     WiFiManager wm;
-    wm.addParameter(&p_dev);    wm.addParameter(&p_join);   wm.addParameter(&p_key);
-    wm.addParameter(&p_pcb);    wm.addParameter(&p_alt);    wm.addParameter(&p_delay);
-    wm.addParameter(&p_sample); wm.addParameter(&p_windoff);wm.addParameter(&p_winden);
-    wm.addParameter(&p_rainen); wm.addParameter(&p_lipo);   wm.addParameter(&p_cpu);
+    const char* menu[] = { "wifi", "info", "custom", "sep", "exit" };
+    wm.setMenu(menu, 5);
+    wm.setCustomMenuHTML("<div style='margin:0.75rem 0 1rem 0;'><div style='font-size:0.85rem;opacity:0.75;margin:0 0 0.25rem 0;'>Firmware version: " FIRMWARE_VERSION "</div><form action='/param' method='get'><button>LoRa-Weather-Node Parameter</button></form><br/><form action='/update' method='get'><button>Firmwareupdate</button></form></div>");
+
+    wm.addParameter(&p_section);
+    wm.addParameter(&p_dev);    wm.addParameter(&p_join);   wm.addParameter(&p_key); wm.addParameter(&p_region);
+    wm.addParameter(&p_pcb);    wm.addParameter(&p_alt);    wm.addParameter(&p_uplink);
+    wm.addParameter(&p_sample); wm.addParameter(&p_windoff);wm.addParameter(&p_windunit);
+    wm.addParameter(&p_winden);
+    wm.addParameter(&p_rainen); wm.addParameter(&p_lipo);   wm.addParameter(&p_debug); wm.addParameter(&p_cpu);
 
     // Update display once the AP is up and the IP address is known
     wm.setAPCallback([](WiFiManager*) {
@@ -258,16 +337,19 @@ static Config runConfigPortal(const Config& cur)
     if (strlen(p_dev.getValue())  == 16) c.devEui  = hexToUint64(p_dev.getValue());
     if (strlen(p_join.getValue()) == 16) c.joinEui = hexToUint64(p_join.getValue());
     if (strlen(p_key.getValue())  == 32) hexToBytes(p_key.getValue(), c.appKey, 16);
+    normalizeRegionInput(p_region.getValue(), c.region, sizeof(c.region));
     int pcb = atoi(p_pcb.getValue());
-    c.pcbVersion       = (pcb == 13) ? 13 : 12;
-    if (atoi(p_alt.getValue())   > 0) c.altitudeM    = atoi(p_alt.getValue());
-    if (atoi(p_delay.getValue()) > 0) c.sendDelaySec = atoi(p_delay.getValue());
+    c.pcbVersion       = (pcb == 12) ? 12 : 13;
+    if (atoi(p_alt.getValue()) > 0) c.altitudeM = atoi(p_alt.getValue());
+    if (atoi(p_uplink.getValue()) > 0) c.uplinkIntervalSec = atoi(p_uplink.getValue());
     int ss = atoi(p_sample.getValue());
-    c.sampleSec        = (ss > 0) ? min(ss, c.sendDelaySec) : c.sampleSec;
+    c.sampleSec        = (ss > 0) ? min(ss, c.uplinkIntervalSec) : c.sampleSec;
     c.windDirOffsetDeg = atoi(p_windoff.getValue());
+    c.windUnitMs       = (atoi(p_windunit.getValue()) == 0) ? 0 : 1;
     c.windEn           = atoi(p_winden.getValue());
     c.rainEn           = atoi(p_rainen.getValue());
     c.lipoEn           = atoi(p_lipo.getValue());
+    c.debugMode        = (atoi(p_debug.getValue()) == 1) ? 1 : 0;
     c.cpuFreqMhz       = (atoi(p_cpu.getValue()) == 240) ? 240 : 80;
     return c;
 }
@@ -415,8 +497,8 @@ float    bme280Humidity = 0.0f;
 float    bus1Temps[MAX_SENSORS_PER_BUS];
 int      bus1Count = 0;
 
-float    windSpeedKmh  = 0.0f;
-float    windGustKmh   = 0.0f;
+float    windSpeedMs   = 0.0f;
+float    windGustMs    = 0.0f;
 float    rainMM        = 0.0f;
 float    rainRateMmH   = 0.0f;
 uint16_t windDirection = 0;
@@ -425,8 +507,8 @@ float    cpuTemperature = 0.0f;
 
 // ============================================================================
 // SAMPLING ACCUMULATORS
-// A sub-sample is taken every sampleSec seconds (max. sendDelaySec).
-// At the end of the send interval accumulators are reduced to final values.
+// A sub-sample is taken every sampleSec seconds (max. uplinkIntervalSec).
+// At the end of the uplink interval accumulators are reduced to final values.
 // Wind direction: vector averaging (sin/cos) so that 350°+10° → 0° is correct.
 // ============================================================================
 static float         windDirSinSum    = 0.0f;
@@ -483,6 +565,7 @@ static uint16_t readWindDirection()
 
 static void readPulseCounters()
 {
+    constexpr float DAVIS_MS_PER_PPS = 1.00584f; // 2.25 mph per Hz converted to m/s
     int16_t       curWind = 0, curRain = 0;
     unsigned long now     = millis();
     unsigned long elapsed = now - previousMillis;
@@ -493,9 +576,9 @@ static void readPulseCounters()
         int16_t pulsesWind = curWind - pulsesLastCountWindspeed;
         pulsesLastCountWindspeed = curWind;
         float pps    = (float)pulsesWind / ((float)elapsed / 1000.0f);
-        windSpeedKmh = pps * 2.25f * 1.60934f;
-        if (windSpeedKmh > windGustKmh) windGustKmh = windSpeedKmh;
-        Serial.printf("Wind: %d pulses → %.1f km/h (gust %.1f)\n", pulsesWind, windSpeedKmh, windGustKmh);
+        windSpeedMs  = pps * DAVIS_MS_PER_PPS;
+        if (windSpeedMs > windGustMs) windGustMs = windSpeedMs;
+        Serial.printf("Wind: %d pulses → %.1f m/s (gust %.1f)\n", pulsesWind, windSpeedMs, windGustMs);
     }
 
     if (gCfg.rainEn) {
@@ -570,7 +653,7 @@ static void resetAccumulators()
     bme280PressSeaSum = 0.0f;
     bme280HumSum      = 0.0f;
     rainCycleMm       = 0.0f;
-    windGustKmh       = 0.0f;
+    windGustMs        = 0.0f;
     subSampleCount    = 0;
     loopCount++;   // increment cycle counter after transmission
 }
@@ -578,14 +661,14 @@ static void resetAccumulators()
 // Take one sub-sample (called every sampleMs)
 static void takeSample()
 {
-    readPulseCounters();   // windSpeedKmh, windGustKmh, rainMM, rainMMSinceStart
+    readPulseCounters();   // windSpeedMs, windGustMs, rainMM, rainMMSinceStart
 
     if (gCfg.windEn) {
         uint16_t dir = readWindDirection();
         float rad     = dir * DEG_TO_RAD;
         windDirSinSum += sinf(rad);
         windDirCosSum += cosf(rad);
-        windSpeedSum  += windSpeedKmh;
+        windSpeedSum  += windSpeedMs;
     }
     if (gCfg.rainEn)
         rainCycleMm += rainMM;
@@ -611,7 +694,10 @@ static void computeFinalValues(unsigned long elapsedMs)
         float avgCos  = windDirCosSum / subSampleCount;
         int   angleDeg = (int)roundf(atan2f(avgSin, avgCos) * RAD_TO_DEG);
         windDirection = (uint16_t)((angleDeg % 360 + 360) % 360);
-        windSpeedKmh  = windSpeedSum / subSampleCount;
+        windSpeedMs   = windSpeedSum / subSampleCount;
+        // Gust should not be lower than the cycle average, otherwise some
+        // dashboard queries may treat gust as missing at very short sample windows.
+        if (windGustMs < windSpeedMs) windGustMs = windSpeedMs;
     }
     if (gCfg.rainEn) {
         rainMM      = rainCycleMm;
@@ -630,9 +716,9 @@ static void computeFinalValues(unsigned long elapsedMs)
     cpuTemperature = heltec_temperature();
     batteryVolt    = gCfg.lipoEn ? readBatteryVoltage() : 0.0f;
 
-    Serial.printf("[Cycle %d samples] Wind: %d°, %.1f km/h (gust %.1f) | "
+    Serial.printf("[Cycle %d samples] Wind: %d°, %.1f m/s (gust %.1f) | "
                   "Rain: %.1f mm @ %.1f mm/h | Batt: %.2fV | CPU: %.1f°C\n",
-                  subSampleCount, windDirection, windSpeedKmh, windGustKmh,
+                  subSampleCount, windDirection, windSpeedMs, windGustMs,
                   rainMM, rainRateMmH, batteryVolt, cpuTemperature);
 }
 
@@ -641,35 +727,46 @@ static void computeFinalValues(unsigned long elapsedMs)
 // ============================================================================
 static void buildLppPacket()
 {
+    const bool  txWindAsMs   = (gCfg.windUnitMs != 0);
+    const float txWindFactor = txWindAsMs ? 1.0f : 3.6f;
+
     lpp.reset();
     if (gCfg.windEn) {
         lpp.addDirection  (1, windDirection);
-        lpp.addAnalogInput(1, windSpeedKmh);
-        lpp.addAnalogInput(2, windGustKmh);
+        lpp.addAnalogInput(1, windSpeedMs * txWindFactor);
+        lpp.addAnalogInput(2, windGustMs  * txWindFactor);
     }
     if (gCfg.rainEn) {
         lpp.addAnalogInput(3, rainRateMmH);
         lpp.addDistance   (1, rainMM           / 1000.0f);   // mm → m (LPP unit)
         lpp.addDistance   (2, rainMMSinceStart / 1000.0f);
     }
-    lpp.addTemperature    (1, cpuTemperature);
-    lpp.addDigitalInput   (1, loopCount);                   // cycle counter (no increment here)
 
-    // Status byte: BME280 Bit0, Bus1 Bit1, errors Bit2-5
+    // Status byte: BME280 Bit0, Bus1 Bit1, errors Bit2-5, wind unit Bit6 (0=km/h, 1=m/s)
     uint8_t status = 0;
     if (bme280Present)  status |= (1 << 0);
     if (bus1Count > 0)  status |= (1 << 1);
     status |= (uint8_t)(min(sendFailCount, 15) << 2);
+    if (txWindAsMs)     status |= (1 << 6);
     lpp.addDigitalInput   (2, status);
     if (gCfg.lipoEn) lpp.addVoltage(1, batteryVolt);
     if (bme280Present) {
         lpp.addRelativeHumidity  (1, bme280Humidity);
         lpp.addBarometricPressure(1, bme280PressSea);
         lpp.addBarometricPressure(2, bme280PressAbs);
-        lpp.addTemperature       (2, bme280TempC);
+        lpp.addTemperature       (1, bme280TempC);
     }
     for (int i = 0; i < bus1Count; i++)
-        if (bus1Temps[i] != DEVICE_DISCONNECTED_C) lpp.addTemperature(3 + i, bus1Temps[i]);
+        if (bus1Temps[i] != DEVICE_DISCONNECTED_C) lpp.addTemperature(2 + i, bus1Temps[i]);
+
+    if (gCfg.debugMode) {
+        // Keep debug channels high so production channels stay stable and compact.
+        lpp.addDigitalInput(200, loopCount);
+        lpp.addTemperature (201, cpuTemperature);
+        lpp.addDigitalInput(202, (uint8_t)min(sendFailCount, 255));
+        lpp.addAnalogInput (203, (float)ESP.getFreeHeap() / 1024.0f);
+        lpp.addAnalogInput (204, (float)millis() / 3600000.0f);
+    }
 
     // EU868: DR0/SF12 = max 51 bytes, DR5/SF7 = max 222 bytes payload
     if (lpp.getSize() > 51)
@@ -679,6 +776,54 @@ static void buildLppPacket()
 static void processDownlink(const uint8_t* data, size_t len)
 {
     if (len < 1) return;
+
+    auto applyDownlinkParam = [](uint8_t paramId, int16_t value) -> bool {
+        switch (paramId) {
+            case 1: // uplinkIntervalSec
+                if (value < 5 || value > 3600) return false;
+                gCfg.uplinkIntervalSec = value;
+                if (gCfg.sampleSec > gCfg.uplinkIntervalSec) {
+                    gCfg.sampleSec = gCfg.uplinkIntervalSec;
+                }
+                return true;
+            case 2: // sampleSec
+                if (value < 1 || value > gCfg.uplinkIntervalSec) return false;
+                gCfg.sampleSec = value;
+                return true;
+            case 3: // windEn
+                if (value != 0 && value != 1) return false;
+                gCfg.windEn = value;
+                return true;
+            case 4: // rainEn
+                if (value != 0 && value != 1) return false;
+                gCfg.rainEn = value;
+                return true;
+            case 5: // lipoEn
+                if (value != 0 && value != 1) return false;
+                gCfg.lipoEn = value;
+                return true;
+            case 6: // debugMode
+                if (value != 0 && value != 1) return false;
+                gCfg.debugMode = value;
+                return true;
+            case 7: // windDirOffsetDeg
+                if (value < -180 || value > 180) return false;
+                gCfg.windDirOffsetDeg = value;
+                return true;
+            case 8: // windUnitMs
+                if (value != 0 && value != 1) return false;
+                gCfg.windUnitMs = value;
+                return true;
+            case 9: // cpuFreqMhz
+                if (value != 80 && value != 240) return false;
+                gCfg.cpuFreqMhz = value;
+                setCpuFrequencyMhz(gCfg.cpuFreqMhz);
+                return true;
+            default:
+                return false;
+        }
+    };
+
     switch (data[0]) {
         case 0x01:
             rainMMSinceStart = 0.0f;
@@ -693,6 +838,36 @@ static void processDownlink(const uint8_t* data, size_t len)
             Serial.println("Downlink: config portal requested.");
             portalRequestedViaDownlink = true;
             break;
+        case 0x04:
+            gCfg.debugMode = 1;
+            saveConfig(gCfg);
+            Serial.println("Downlink: debug mode enabled.");
+            break;
+        case 0x05:
+            gCfg.debugMode = 0;
+            saveConfig(gCfg);
+            Serial.println("Downlink: debug mode disabled.");
+            break;
+        case 0x10: {
+            // Format: [0x10, paramId, valueMSB, valueLSB, ...] (1..9)
+            if (len < 4 || ((len - 1) % 3) != 0) {
+                Serial.println("Downlink: invalid parameter payload length.");
+                break;
+            }
+            bool anyApplied = false;
+            for (size_t i = 1; i + 2 < len; i += 3) {
+                uint8_t paramId = data[i];
+                int16_t value = (int16_t)(((uint16_t)data[i + 1] << 8) | data[i + 2]);
+                bool ok = applyDownlinkParam(paramId, value);
+                Serial.printf("Downlink: set param %u = %d -> %s\n",
+                              paramId, value, ok ? "OK" : "INVALID");
+                anyApplied = anyApplied || ok;
+            }
+            if (anyApplied) {
+                saveConfig(gCfg);
+            }
+            break;
+        }
         default:
             Serial.printf("Downlink: unknown command 0x%02X\n", data[0]);
             break;
@@ -743,7 +918,14 @@ static void drawDisplay()
     display.clear();
 
     if (gCfg.windEn) {
-        snprintf(buf, sizeof(buf), "Dir/Spd: %d deg, %.1f km/h", windDirection, windSpeedKmh);
+        const bool showWindAsMs      = (gCfg.windUnitMs != 0);
+        const float displayWindFactor = showWindAsMs ? 1.0f : 3.6f;
+        const char* windUnitLabel     = showWindAsMs ? "m/s" : "km/h";
+        snprintf(buf, sizeof(buf), "D%03d S%.1f G%.1f %s",
+                 windDirection,
+                 windSpeedMs * displayWindFactor,
+                 windGustMs  * displayWindFactor,
+                 windUnitLabel);
         display.drawString(0,  0, buf);
     }
 
@@ -760,7 +942,7 @@ static void drawDisplay()
         snprintf(buf, sizeof(buf), "no BME280");
     display.drawString(0, 22, buf);
 
-    snprintf(buf, sizeof(buf), "Batt: %.3fV  CPU: %.1f°C", batteryVolt, cpuTemperature);
+    snprintf(buf, sizeof(buf), "Batt: %.3fV", batteryVolt);
     display.drawString(0, 33, buf);
 }
 
@@ -856,7 +1038,7 @@ void setup()
     display.display();
     int joinAttempts = 0;
     do {
-        persist.provision("EU868", 0x00, gCfg.joinEui, gCfg.devEui, gCfg.appKey, gCfg.appKey);
+        persist.provision(gCfg.region, 0x00, gCfg.joinEui, gCfg.devEui, gCfg.appKey, gCfg.appKey);
         persist.isProvisioned();
         loRaNode = persist.manage(&radio);
 
@@ -975,8 +1157,8 @@ void loop()
     updateDisplayState();
 
     const unsigned long now           = millis();
-    const unsigned long sendTargetMs  = (unsigned long)gCfg.sendDelaySec * 1000UL;
-    // Sample interval from config; never larger than send interval
+    const unsigned long sendTargetMs  = (unsigned long)gCfg.uplinkIntervalSec * 1000UL;
+    // Sample interval from config; never larger than uplink interval
     const unsigned long sampleMs      = min((unsigned long)gCfg.sampleSec * 1000UL, sendTargetMs);
 
     // ── Take sub-sample ────────────────────────────────────────────────────
@@ -985,7 +1167,7 @@ void loop()
         takeSample();
     }
 
-    // ── Send when target interval reached ─────────────────────────────────
+    // ── Uplink when target interval reached ───────────────────────────────
     if (now - lastSendMs >= sendTargetMs) {
         const unsigned long elapsedMs = now - lastSendMs;
         lastSendMs = now;
