@@ -253,6 +253,9 @@ QNH = absolute pressure × (1 - 0.0000226 × altitude[m])^(-5.255)
 | Ch 1 | Temperature | BME280 temperature | °C | BME280 detected |
 | Ch 2–4 | Temperature | DS18B20 sensor 0–2 | °C | sensor detected |
 
+> **Rain encoding note:** The payload uses the CayenneLPP **Distance** type for rain values, but in this project it is interpreted as **mm** (`rain_cycle_mm`, `rain_since_start_mm`).
+> Use the provided decoder in [chirpstack/decoder.js](chirpstack/decoder.js). Generic CayenneLPP decoders might assume meters, but you have to know the values are millimeters.
+
 > In normal operation (`debugMode = 0`) no debug telemetry is sent.
 
 > **Payload size:**  
@@ -348,6 +351,8 @@ The display is **off** during normal operation to protect the SSD1306 driver and
 ## ChirpStack Payload Decoder
 
 The file `chirpstack/decoder.js` contains the JavaScript decoder for ChirpStack v3 and v4.
+
+> **Tip:** The decoder file can also be downloaded directly from the device via the Wi-Fi config portal (*Payload decoder (JS)* button on the start page). The downloaded file is always version-matched to the running firmware.
 
 **Adding the decoder to ChirpStack:**
 1. In the ChirpStack web interface: *Device Profiles → Codec → JavaScript codec functions*

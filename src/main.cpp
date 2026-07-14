@@ -35,8 +35,8 @@
  *   Ch  3 Analog Input     → rain rate (mm/h, if rain sensor enabled)
  *   Ch200 Analog Input     → free heap (KiB, debug mode only)
  *   Ch204 Analog Input     → uptime (h, debug mode only)
- *   Ch  1 Distance         → rain current cycle (m; ×1000 → mm, if rain sensor enabled)
- *   Ch  2 Distance         → rain since start (m; ×1000 → mm, if rain sensor enabled)
+ *   Ch  1 Distance         → rain current cycle (mm, if rain sensor enabled)
+ *   Ch  2 Distance         → rain since start (mm, if rain sensor enabled)
  *   Ch  2 Digital Input    → status byte: Bit0=BME280, Bit1=Bus1, Bit2-5=errors, Bit6=wind unit
  *   Ch200 Digital Input    → cycle counter (0–255, debug mode only)
  *   Ch202 Digital Input    → send fail counter (0-255, debug mode only)
@@ -100,6 +100,7 @@
 #include <esp_netif.h>
 #include <esp_event.h>
 #include "generated_version.h"
+#include "decoder_js.h"
 
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "dev"
@@ -296,7 +297,17 @@ static Config runConfigPortal(const Config& cur)
     WiFiManager wm;
     const char* menu[] = { "wifi", "info", "custom", "sep", "exit" };
     wm.setMenu(menu, 5);
-    wm.setCustomMenuHTML("<div style='margin:0.75rem 0 1rem 0;'><div style='font-size:0.85rem;opacity:0.75;margin:0 0 0.25rem 0;'>Firmware version: " FIRMWARE_VERSION "</div><form action='/param' method='get'><button>LoRa-Weather-Node Parameter</button></form><br/><form action='/update' method='get'><button>Firmwareupdate</button></form></div>");
+    wm.setCustomMenuHTML("<div style='margin:0.75rem 0 1rem 0;'><div style='font-size:0.85rem;opacity:0.75;margin:0 0 0.25rem 0;'>Firmware version: " FIRMWARE_VERSION "</div><form action='/param' method='get'><button>LoRa-Weather-Node Parameter</button></form><br/><form action='/decoder' method='get'><button>Payload decoder (JS)</button></form><br/><form action='/update' method='get'><button>Firmwareupdate</button></form></div>");
+
+    // Register a custom /decoder route that serves the version-matched payload
+    // decoder (embedded from chirpstack/decoder.js) as a downloadable JS file.
+    wm.setWebServerCallback([&wm]() {
+        wm.server->on("/decoder", [&wm]() {
+            wm.server->sendHeader("Content-Disposition",
+                                  "attachment; filename=\"weather-node-decoder.js\"");
+            wm.server->send_P(200, "application/javascript; charset=utf-8", DECODER_JS);
+        });
+    });
 
     wm.addParameter(&p_section);
     wm.addParameter(&p_dev);    wm.addParameter(&p_join);   wm.addParameter(&p_key); wm.addParameter(&p_region);
@@ -485,8 +496,76 @@ static int16_t       pulsesLastCountRain      = 0;
 static unsigned long previousMillis           = 0;
 static int           sendFailCount            = 0;
 static bool          portalRequestedViaDownlink = false;
+static bool          windPcntConfigured       = false;
+static bool          rainPcntConfigured       = false;
 
 static PinSet        gPins = { 3, 4, 5 };  // set in setup()
+
+static void configureWindPcnt()
+{
+    if (!windPcntConfigured) {
+        pcnt_config_t pcnt_wind = {
+            .pulse_gpio_num = gPins.windSpeed,
+            .ctrl_gpio_num  = PCNT_PIN_NOT_USED,
+            .pos_mode       = PCNT_COUNT_INC,
+            .neg_mode       = PCNT_COUNT_DIS,
+            .counter_h_lim  = 32767,
+            .counter_l_lim  = -32768,
+            .unit           = PCNT_UNIT_WINDSPEED,
+            .channel        = PCNT_CHANNEL_WINDSPEED,
+        };
+        pcnt_unit_config(&pcnt_wind);
+        pcnt_set_filter_value(PCNT_UNIT_WINDSPEED, FILTER_VALUE_WINDSPEED);
+        pcnt_filter_enable(PCNT_UNIT_WINDSPEED);
+        windPcntConfigured = true;
+    }
+
+    pcnt_counter_pause(PCNT_UNIT_WINDSPEED);
+    pcnt_counter_clear(PCNT_UNIT_WINDSPEED);
+    pcnt_counter_resume(PCNT_UNIT_WINDSPEED);
+    pulsesLastCountWindspeed = 0;
+}
+
+static void configureRainPcnt()
+{
+    if (!rainPcntConfigured) {
+        pcnt_config_t pcnt_rain = {
+            .pulse_gpio_num = gPins.rain,
+            .ctrl_gpio_num  = PCNT_PIN_NOT_USED,
+            .pos_mode       = PCNT_COUNT_INC,
+            .neg_mode       = PCNT_COUNT_DIS,
+            .counter_h_lim  = 32767,
+            .counter_l_lim  = -32768,
+            .unit           = PCNT_UNIT_RAIN,
+            .channel        = PCNT_CHANNEL_RAIN,
+        };
+        pcnt_unit_config(&pcnt_rain);
+        pcnt_set_filter_value(PCNT_UNIT_RAIN, FILTER_VALUE_RAIN);
+        pcnt_filter_enable(PCNT_UNIT_RAIN);
+        rainPcntConfigured = true;
+    }
+
+    pcnt_counter_pause(PCNT_UNIT_RAIN);
+    pcnt_counter_clear(PCNT_UNIT_RAIN);
+    pcnt_counter_resume(PCNT_UNIT_RAIN);
+    pulsesLastCountRain = 0;
+}
+
+static void stopWindPcnt()
+{
+    if (!windPcntConfigured) return;
+    pcnt_counter_pause(PCNT_UNIT_WINDSPEED);
+    pcnt_counter_clear(PCNT_UNIT_WINDSPEED);
+    pulsesLastCountWindspeed = 0;
+}
+
+static void stopRainPcnt()
+{
+    if (!rainPcntConfigured) return;
+    pcnt_counter_pause(PCNT_UNIT_RAIN);
+    pcnt_counter_clear(PCNT_UNIT_RAIN);
+    pulsesLastCountRain = 0;
+}
 
 bool     bme280Present  = false;
 float    bme280TempC    = 0.0f;
@@ -738,8 +817,9 @@ static void buildLppPacket()
     }
     if (gCfg.rainEn) {
         lpp.addAnalogInput(3, rainRateMmH);
-        lpp.addDistance   (1, rainMM           / 1000.0f);   // mm → m (LPP unit)
-        lpp.addDistance   (2, rainMMSinceStart / 1000.0f);
+        // Distance field is intentionally used as millimeter carrier for rain values.
+        lpp.addDistance   (1, rainMM);
+        lpp.addDistance   (2, rainMMSinceStart);
     }
 
     // Status byte: BME280 Bit0, Bus1 Bit1, errors Bit2-5, wind unit Bit6 (0=km/h, 1=m/s)
@@ -792,11 +872,27 @@ static void processDownlink(const uint8_t* data, size_t len)
                 return true;
             case 3: // windEn
                 if (value != 0 && value != 1) return false;
+                if (gCfg.windEn == value) return true;
                 gCfg.windEn = value;
+                if (gCfg.windEn) {
+                    configureWindPcnt();
+                } else {
+                    stopWindPcnt();
+                    windSpeedMs = 0.0f;
+                    windGustMs = 0.0f;
+                }
                 return true;
             case 4: // rainEn
                 if (value != 0 && value != 1) return false;
+                if (gCfg.rainEn == value) return true;
                 gCfg.rainEn = value;
+                if (gCfg.rainEn) {
+                    configureRainPcnt();
+                } else {
+                    stopRainPcnt();
+                    rainMM = 0.0f;
+                    rainRateMmH = 0.0f;
+                }
                 return true;
             case 5: // lipoEn
                 if (value != 0 && value != 1) return false;
@@ -1095,45 +1191,9 @@ void setup()
     sensorsBus1 = new DallasTemperature(oneWireBus1);
     sensorsBus1->begin();
 
-    // PCNT wind speed
-    if (gCfg.windEn) {
-        pcnt_config_t pcnt_wind = {
-            .pulse_gpio_num = pins.windSpeed,
-            .ctrl_gpio_num  = PCNT_PIN_NOT_USED,
-            .pos_mode       = PCNT_COUNT_INC,
-            .neg_mode       = PCNT_COUNT_DIS,
-            .counter_h_lim  = 32767,
-            .counter_l_lim  = -32768,
-            .unit           = PCNT_UNIT_WINDSPEED,
-            .channel        = PCNT_CHANNEL_WINDSPEED,
-        };
-        pcnt_unit_config(&pcnt_wind);
-        pcnt_set_filter_value(PCNT_UNIT_WINDSPEED, FILTER_VALUE_WINDSPEED);
-        pcnt_filter_enable(PCNT_UNIT_WINDSPEED);
-        pcnt_counter_pause(PCNT_UNIT_WINDSPEED);
-        pcnt_counter_clear(PCNT_UNIT_WINDSPEED);
-        pcnt_counter_resume(PCNT_UNIT_WINDSPEED);
-    }
-
-    // PCNT rain sensor
-    if (gCfg.rainEn) {
-        pcnt_config_t pcnt_rain = {
-            .pulse_gpio_num = pins.rain,
-            .ctrl_gpio_num  = PCNT_PIN_NOT_USED,
-            .pos_mode       = PCNT_COUNT_INC,
-            .neg_mode       = PCNT_COUNT_DIS,
-            .counter_h_lim  = 32767,
-            .counter_l_lim  = -32768,
-            .unit           = PCNT_UNIT_RAIN,
-            .channel        = PCNT_CHANNEL_RAIN,
-        };
-        pcnt_unit_config(&pcnt_rain);
-        pcnt_set_filter_value(PCNT_UNIT_RAIN, FILTER_VALUE_RAIN);
-        pcnt_filter_enable(PCNT_UNIT_RAIN);
-        pcnt_counter_pause(PCNT_UNIT_RAIN);
-        pcnt_counter_clear(PCNT_UNIT_RAIN);
-        pcnt_counter_resume(PCNT_UNIT_RAIN);
-    }
+    // PCNT counters are configured once and can be toggled later via downlink.
+    if (gCfg.windEn) configureWindPcnt();
+    if (gCfg.rainEn) configureRainPcnt();
 
     previousMillis = millis();
     lastSampleMs   = millis();

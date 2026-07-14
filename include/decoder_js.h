@@ -1,3 +1,5 @@
+#pragma once
+static const char DECODER_JS[] PROGMEM = R"DECODERJS(
 /**
  * ChirpStack Payload Decoder – LoRaWAN Weather Node
  *
@@ -178,3 +180,5 @@ function Decode(fPort, bytes) {
         return { error: e.toString() };
     }
 }
+
+)DECODERJS";
