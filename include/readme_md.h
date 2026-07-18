@@ -1,3 +1,5 @@
+#pragma once
+static const char README_MD[] PROGMEM = R"READMEMD(
 # Weather Node (LoRaWAN + WiFi/MQTT)
 
 Firmware for a custom-designed PCB based on a **Heltec WiFi LoRa 32 V3** (ESP32-S3) that measures wind speed, wind direction, rainfall, temperature, humidity, and barometric pressure.
@@ -12,106 +14,6 @@ All three run **independently and in parallel** — enable any subset via the on
 
 The images below give a quick impression of the hardware journey from empty PCB to finished node and show how the measured data can be visualized in Grafana.
 
-## Project in Pictures
-
-<table>
-  <tr>
-    <td align="center" width="33%">
-      <img src="pictures/pcb-v12-empty.jpeg" alt="PCB Rev 1.2, empty board" width="100%">
-      <br><strong>PCB, empty</strong>
-    </td>
-    <td align="center" width="33%">
-      <img src="pictures/pcb-v12-assembled.jpeg" alt="PCB Rev 1.2, assembled board" width="100%">
-      <br><strong>PCB, assembled</strong>
-    </td>
-    <td align="center" width="33%">
-      <img src="pictures/pcb-v12-operational.jpeg" alt="PCB Rev 1.2, operational board" width="100%">
-      <br><strong>PCB, in operation</strong>
-    </td>
-  </tr>
-</table>
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="pictures/grafana-wind.jpeg" alt="Grafana dashboard for wind data" width="100%">
-      <br><strong>Grafana: wind data</strong>
-    </td>
-    <td align="center" width="50%">
-      <img src="pictures/grafana-rain-temp-preassure.jpeg" alt="Grafana dashboard for rain, temperature and pressure" width="100%">
-      <br><strong>Grafana: rain, temperature and pressure</strong>
-    </td>
-  </tr>
-</table>
-
-The following screenshots show the Wi-Fi configuration flow. This setup is designed to be quick and beginner-friendly, even without USB tools.
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-config-startpage.png" alt="Wi-Fi manager start page" width="100%">
-      <br><strong>Wi-Fi manager: start page</strong>
-    </td>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-config-loraparameter.png" alt="Wi-Fi manager LoRaWAN parameter section" width="100%">
-      <br><strong>Parameters: LoRaWAN</strong>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-config-unitsandsensor.png" alt="Wi-Fi manager Units and Sensor Calibration parameter section" width="100%">
-      <br><strong>Parameters: Units &amp; Sensor Calibration</strong>
-    </td>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-config-generalparameter.png" alt="Wi-Fi manager General Parameters section" width="100%">
-      <br><strong>Parameters: General</strong>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-config-wifimqttparameter.png" alt="Wi-Fi manager WiFi and MQTT parameter section" width="100%">
-      <br><strong>Parameters: Wi-Fi + MQTT</strong>
-    </td>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-config-firmwareupdate.jpeg" alt="Wi-Fi manager firmware update page" width="100%">
-      <br><strong>Wi-Fi manager: firmware update</strong>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-config-firmwareupdate-success.jpeg" alt="Wi-Fi manager firmware update successful" width="100%">
-      <br><strong>Wi-Fi manager: update successful</strong>
-    </td>
-    <td width="50%"></td>
-  </tr>
-</table>
-
-Once Wi-Fi and the REST API are enabled, these built-in web pages provide day-to-day monitoring and diagnostics without ever needing to reopen the config portal:
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-statuspage.png" alt="Web status page" width="100%">
-      <br><strong>Web: status page (<code>/</code>)</strong>
-    </td>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-rest-json.png" alt="REST API raw JSON response" width="100%">
-      <br><strong>Web: REST API (<code>/api/data</code>)</strong>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-helppage.png" alt="Embedded help / documentation page" width="100%">
-      <br><strong>Web: help / documentation (<code>/help</code>)</strong>
-    </td>
-    <td align="center" width="50%">
-      <img src="pictures/wifi-logconsole.png" alt="Device log console" width="100%">
-      <br><strong>Web: device log (<code>/api/log</code>)</strong>
-    </td>
-  </tr>
-</table>
-
----
 
 ## 📄 License & Open Source
 
@@ -914,3 +816,4 @@ The `LoRaWAN_ESP32` library stores the LoRaWAN session (frame counters, DevAddr,
 
 ### ADC Linearity
 The ESP32-S3 ADC is non-linear (especially below 150 mV and above 3.1 V). For the wind direction potentiometer this is uncritical since values are mapped to 0–359° and the absolute measurement error remains < 5° in practice. For the battery voltage measurement a calibration factor is included in the code.
+)READMEMD";

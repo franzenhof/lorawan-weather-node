@@ -51,6 +51,41 @@ if decoder_src.exists():
     )
 
 
+# Embed README.md into a PROGMEM string so it can be served as a rendered
+# help page from the WiFi config portal and the persistent web server
+# (/help route). Single source of truth: the repo's README.md is the only
+# copy to maintain. The "Project in Pictures" image gallery is stripped since
+# the referenced JPEG/PNG files aren't embedded and would just show broken
+# image icons.
+readme_src = Path(env.get("PROJECT_DIR")) / "README.md"
+readme_hdr = Path(env.get("PROJECT_DIR")) / "include" / "readme_md.h"
+if readme_src.exists():
+    lines = readme_src.read_text(encoding="utf-8").splitlines()
+    out_lines = []
+    skipping = False
+    for line in lines:
+        if not skipping and line.strip() == "## Project in Pictures":
+            skipping = True
+            continue
+        if skipping:
+            if line.strip() == "---":
+                skipping = False
+            continue
+        out_lines.append(line)
+    md = "\n".join(out_lines)
+
+    delim = "READMEMD"
+    if f"){delim}\"" in md:
+        raise RuntimeError("README.md contains the raw-string delimiter )" + delim)
+    readme_hdr.write_text(
+        "#pragma once\n"
+        f'static const char README_MD[] PROGMEM = R"{delim}(\n'
+        + md
+        + f'\n){delim}";\n',
+        encoding="utf-8",
+    )
+
+
 def copy_firmware(*args, **kwargs):
     build_dir = Path(env.subst("$BUILD_DIR"))
     prog_name = env.subst("$PROGNAME")

@@ -3,7 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
-pcblayout/lorawan-weather-node-pcb rev13/*
+pcblayout/lorawan-weather-node-pcb-gerberfile rev13/*
 kicad/*
 kicad
 .DS_Store
